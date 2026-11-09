@@ -944,6 +944,7 @@
     "server/steer-unattended.e2e.test.ts": 1,
     "server/store.test.ts": 18,
     "server/surface-pins.e2e.test.ts": 54,
+    "server/talana-tenancy.e2e.test.ts": 17,
     "server/team-backup-workflow.test.ts": 6,
     "server/team-backup.test.ts": 16,
     "server/team-lifecycle.e2e.test.ts": 10,

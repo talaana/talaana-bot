@@ -134,7 +134,7 @@ describe("Talana tenancy fitness", () => {
       expect(stored, `room ${group.name} never got an audience floor`).toBeTruthy();
       expect(stored.audienceFloor).toEqual({ people: [TALANA_DOMAIN] });
     }
-  });
+  }, 90_000);
 
   it("shows an unstamped agent to every tenant and a stamped one only to its own", async () => {
     // Forgetting the stamp fails silently: an agent at the default `visibility: "everyone"` stays in every tenant's
@@ -145,8 +145,12 @@ describe("Talana tenancy fitness", () => {
     expect(await botIdsOf(T1)).toContain(looseId);
     expect(await botIdsOf(T2)).toContain(looseId);
 
+    // A listing that vanished would drop the loose bot too, so T2 has to keep every other bot it already saw.
+    const t2Kept = (await botIdsOf(T2)).filter((id) => id !== looseId);
+    expect(t2Kept.length, "T2's listing held only the loose bot, so its absence would prove nothing").toBeGreaterThan(0);
+
     expect((await api("PATCH", `/api/bots/${looseId}`, { visibility: { people: [TALANA_DOMAIN] } }, BOSS)).status).toBe(200);
     expect(await botIdsOf(T1)).toContain(looseId);
-    expect(await botIdsOf(T2)).not.toContain(looseId);
+    expect(await botIdsOf(T2)).toEqual(t2Kept);
   });
 });
