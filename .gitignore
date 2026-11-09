@@ -3,9 +3,9 @@ dist/
 dist-server/
 dist-companion/
 dist.bak-*/
-data/
-logs/
-docs/
+/data/
+/logs/
+/docs/
 enterprise/
 *.tsbuildinfo
 .DS_Store
