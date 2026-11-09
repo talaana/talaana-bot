@@ -15,6 +15,8 @@ let BASE: string;
 const OPS = "u1@ops.talana.local";
 const T1 = "u11@t-talana.talana.local";
 const T2 = "u21@t-arg.talana.local";
+/** A real customer domain that simply owns nothing: admitted by `signIn.members`, so its session carries client scopes. */
+const IDLE = "u99@t-idle.talana.local";
 const BOSS = OPS;
 const TALANA_DOMAIN = "@t-talana.talana.local";
 const ADMIN_LISTS = ["@ops.talana.local"];
@@ -36,7 +38,7 @@ const api = async (method: string, path: string, body?: unknown, as?: string): P
   return { status: res.status, body: await res.json().catch(() => ({})) };
 };
 
-async function start() {
+async function start(options?: { talanaMode?: boolean }) {
   const port = await freePortBlock([0, 1]);
   BASE = `http://127.0.0.1:${port}`;
   child = spawn(process.execPath, ["--import", pathToFileURL(join(SERVER_DIR, "testing", "hold-search-result.ts")).href, join(SERVER_DIR, "index.ts")], {
@@ -46,6 +48,9 @@ async function start() {
       ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
       HOME: home, USERPROFILE: home, OMB_PORT: String(port), OMB_WEBHOOK_PORT: String(port + 1),
       OMB_TEST_INTERNAL_CAPABILITY_KEY: CAPABILITY_KEY,
+      // A URL no test ever fetches: the SSO handler is only constructed at boot and asks nothing of the network until a
+      // browser hits the exchange route, so this turns the Talana-mode signal on without a network dependency.
+      ...(options?.talanaMode ? { TALANA_API_URL: "http://127.0.0.1:1" } : {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -91,6 +96,38 @@ async function seedTenant(as: string, slug: string): Promise<{ bots: { id: strin
 }
 
 const botIdsOf = async (as: string): Promise<string[]> => (await api("GET", "/api/bots?messages=0", undefined, as)).body.bots.map((bot: any) => bot.id);
+
+const PNG_1PX = Buffer.from("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6360000002000100ffff030000060005ff00010000ffff0300", "hex");
+
+/** Store a file for one caller and hand back the name another caller can ask for. */
+async function uploadPng(as: string): Promise<{ status: number; name: string }> {
+  const res = await fetch(`${BASE}/api/attachments`, { method: "POST", headers: { "content-type": "image/png", ...headers(as, false) }, body: new Uint8Array(PNG_1PX) });
+  const body = (await res.json().catch(() => ({}))) as { path?: string };
+  return { status: res.status, name: (body.path ?? "").split(/[\\/]/).pop() ?? "" };
+}
+
+/** Read `/api/events` for `ms` and hang up. The stream stays open for a live session, so `for await` over it ends
+ * only when the test times out — which reads as a passing assertion after 90 s of wall clock, not before. */
+async function streamText(as: string, ms: number, lastEventId?: string): Promise<string> {
+  const controller = new AbortController();
+  const res = await fetch(`${BASE}/api/events`, { headers: { ...headers(as, false), ...(lastEventId ? { "last-event-id": lastEventId } : {}) }, signal: controller.signal });
+  const decoder = new TextDecoder();
+  let text = "";
+  const drained = (async () => {
+    try {
+      const reader = res.body!.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+      }
+    } catch { /* the abort below */ }
+  })();
+  await new Promise((r) => setTimeout(r, ms));
+  controller.abort();
+  await drained;
+  return text;
+}
 
 describe("Talana tenancy fitness", () => {
   beforeAll(async () => {
@@ -145,6 +182,11 @@ describe("Talana tenancy fitness", () => {
     expect(await botIdsOf(T1)).toContain(looseId);
     expect(await botIdsOf(T2)).toContain(looseId);
 
+    // Give T2 something that is legitimately its own, so the guard below proves the listing works rather than proving
+    // the starter bot is still loose.
+    const hers = await api("POST", "/api/bots", { name: "T2's own", visibility: { people: ["@t-arg.talana.local"] } }, BOSS);
+    expect(hers.status, JSON.stringify(hers.body)).toBe(201);
+
     // A listing that vanished would drop the loose bot too, so T2 has to keep every other bot it already saw.
     const t2Kept = (await botIdsOf(T2)).filter((id) => id !== looseId);
     expect(t2Kept.length, "T2's listing held only the loose bot, so its absence would prove nothing").toBeGreaterThan(0);
@@ -153,4 +195,187 @@ describe("Talana tenancy fitness", () => {
     expect(await botIdsOf(T1)).toContain(looseId);
     expect(await botIdsOf(T2)).toEqual(t2Kept);
   });
+});
+
+describe("Talana cross-tenant leak surfaces", () => {
+  // Planted in tenant B's transcript, because every probe below is made as tenant A: each test then carries the control
+  // that shows the tenant holding the row really does see it.
+  const SECRET = "the-shall-not-be-read-seal";
+  let t1: Awaited<ReturnType<typeof seedTenant>>, t2: Awaited<ReturnType<typeof seedTenant>>;
+  /** A bot's own conversation, read from the admin's listing: `GET /api/bots/:id` is not a route on this server. */
+  const threads: Record<string, string> = {};
+
+  beforeAll(async () => {
+    home = mkdtempSync(join(tmpdir(), "omb-talana-leak-"));
+    const data = join(home, ".openmausbot");
+    mkdirSync(data, { recursive: true });
+    const LISTS = { admins: ["@ops.talana.local"], members: ["@t-talana.talana.local", "@t-arg.talana.local", "@t-idle.talana.local"] };
+    writeFileSync(join(data, "config.json"), JSON.stringify({ signIn: LISTS }));
+    const registry = new SessionRegistry({
+      file: join(data, "sessions.json"),
+      emailScopesSnapshot: () => (email: string) => allowedScopes(email, LISTS),
+      recheckMs: 1_000,
+    });
+    // IDLE is a real customer domain that simply has no agents: a session genuinely authenticated (client scopes,
+    // admitted by signIn.members) that owns nothing. An address no list admits is issued empty scopes, every route
+    // refuses it, and an empty body there would prove only that a 401 carries no JSON.
+    for (const email of [OPS, T1, T2, IDLE]) {
+      const scopes = allowedScopes(email, LISTS);
+      expect(scopes?.length, `${email} is admitted by neither signIn list`).toBeGreaterThan(0);
+      tokens[email] = registry.issue({ label: email, email, scopes: scopes! }).token;
+    }
+    registry.close();
+    await start({ talanaMode: true });
+
+    t1 = await seedTenant(OPS, "talana");
+    t2 = await seedTenant(OPS, "arg");
+    expect(t1.status, JSON.stringify(t1)).toBe(201);
+    expect(t2.status, JSON.stringify(t2)).toBe(201);
+    expect(t1.bots.map((bot) => bot.id)).not.toEqual(expect.arrayContaining(t2.bots.map((bot) => bot.id)));
+    for (const row of (await api("GET", "/api/bots?messages=0", undefined, OPS)).body.bots) threads[row.id] = row.threadId;
+    for (const bot of [...t1.bots, ...t2.bots]) expect(threads[bot.id], `${bot.name} has no conversation to leak`).toBeTruthy();
+
+    const planted = await api("POST", `/api/bots/${t2.bots[0].id}/messages`, { text: `remember the word ${SECRET}` }, OPS);
+    expect(planted.status, JSON.stringify(planted.body)).toBe(202);
+    // Without this, a search probe that found nothing could be a transcript that was never written or never indexed.
+    expect(await waitFor(async () => ((await api("GET", `/api/search?q=${SECRET}`, undefined, OPS)).body.hits?.length ? true : null), 60_000),
+      "the planted word never reached /api/search, not even for the admin whose bot holds it").toBe(true);
+  }, 150_000);
+
+  afterAll(async () => {
+    await waitForExit(child, { signal: "SIGTERM" });
+    await removeTempDir(home);
+  });
+
+  it("lists a member only their own tenant's agents and rooms", async () => {
+    const mine = await api("GET", "/api/bots?messages=0", undefined, T1);
+    expect(mine.status, JSON.stringify(mine.body)).toBe(200);
+    const ids = mine.body.bots.map((bot: any) => bot.id);
+    expect(ids).toEqual(expect.arrayContaining(t1.bots.map((bot) => bot.id)));
+    for (const bot of t2.bots) expect(ids, bot.name).not.toContain(bot.id);
+    const groupIds = mine.body.groups.map((group: any) => group.id);
+    expect(groupIds).toEqual(expect.arrayContaining(t1.groups.map((group) => group.id)));
+    for (const group of t2.groups) expect(groupIds, group.name).not.toContain(group.id);
+  });
+
+  it("refuses a foreign bot and room on every route its neighbour may call: 404, not 403", async () => {
+    for (const bot of t2.bots) {
+      const named = `${bot.name} ${bot.id}`;
+      expect((await api("POST", `/api/bots/${bot.id}/messages`, { text: "hi" }, T1)).status, named).toBe(404);
+      expect((await api("POST", `/api/bots/${bot.id}/read`, { threadId: threads[bot.id] }, T1)).status, named).toBe(404);
+      expect((await api("PATCH", `/api/bots/${bot.id}`, { pinned: true }, T1)).status, named).toBe(404);
+      expect((await api("GET", `/api/threads/${threads[bot.id]}/messages`, undefined, T1)).status, named).toBe(404);
+    }
+    for (const group of t2.groups) {
+      expect((await api("POST", `/api/groups/${group.id}/messages`, { text: "hi" }, T1)).status, group.name).toBe(404);
+      expect((await api("PATCH", `/api/groups/${group.id}`, { name: "taken over" }, T1)).status, group.name).toBe(404);
+    }
+    // The same six routes, the same caller, against rows of its own tenant: without these the 404s above would only
+    // say that a client session is refused everything everywhere.
+    const own = t1.bots[0];
+    expect((await api("POST", `/api/bots/${own.id}/messages`, { text: "mine" }, T1)).status).toBe(202);
+    expect((await api("POST", `/api/bots/${own.id}/read`, { threadId: threads[own.id] }, T1)).status).toBe(200);
+    expect((await api("PATCH", `/api/bots/${own.id}`, { pinned: true }, T1)).status).toBe(200);
+    expect((await api("GET", `/api/threads/${threads[own.id]}/messages`, undefined, T1)).status).toBe(200);
+    expect((await api("POST", `/api/groups/${t1.groups[0].id}/messages`, { text: "in the room" }, T1)).status).toBe(202);
+    expect((await api("PATCH", `/api/groups/${t1.groups[0].id}`, { name: "Renamed by tenant A" }, T1)).status).toBe(200);
+  });
+
+  it("destroys no foreign agent, and no agent at all, from a member's session", async () => {
+    // DELETE /api/bots/:id is on no client allow list (request-auth.ts:292), so the scope gate answers it before a row
+    // is read at all: the same refusal comes for a foreign bot and for the caller's own, and it hides nobody's death.
+    const foreign = await api("DELETE", `/api/bots/${t2.bots[0].id}`, undefined, T1);
+    expect(foreign.status, JSON.stringify(foreign.body)).toBe(403);
+    const own = await api("DELETE", `/api/bots/${t1.bots[0].id}`, undefined, T1);
+    expect(own.status, JSON.stringify(own.body)).toBe(403);
+    const rows = (await api("GET", "/api/bots?messages=0", undefined, OPS)).body.bots.map((bot: any) => bot.id);
+    expect(rows).toContain(t2.bots[0].id);
+  });
+
+  it("keeps the foreign transcript out of search, export and every file route", async () => {
+    const hits = async (as: string) => JSON.stringify((await api("GET", `/api/search?q=${SECRET}`, undefined, as)).body);
+    // The owner half first: the word is in the index and reaches the tenant that holds it.
+    expect(await hits(T2), "the tenant that owns the transcript cannot find its own word").toContain(SECRET);
+    expect(await hits(IDLE)).not.toContain(SECRET);
+    expect(await hits(T1)).not.toContain(SECRET);
+    const foreignThread = threads[t2.bots[0].id];
+    expect((await api("GET", `/api/threads/${foreignThread}/messages`, undefined, T1)).status).toBe(404);
+    expect((await api("GET", `/api/threads/${foreignThread}/export`, undefined, T1)).status).toBe(404);
+    const ownThread = threads[t1.bots[0].id];
+    expect((await api("GET", `/api/threads/${ownThread}/messages`, undefined, T1)).status).toBe(200);
+    const exported = await (await fetch(`${BASE}/api/threads/${foreignThread}/export`, { headers: headers(T2, false) })).text();
+    expect(exported, "the export route hands its owner nothing, so the 404 above would prove nothing").toContain(SECRET);
+  });
+
+  it("serves no attachment that only a neighbour's agent points at", async () => {
+    const mine = await uploadPng(T1);
+    expect(mine.status, "the upload route must work for a member, or the probes below prove nothing").toBe(201);
+    const foreign = await uploadPng(T2);
+    expect(foreign.status, "the upload route must work for a member of the other tenant too").toBe(201);
+    // A stored file nothing references is served to any signed-in caller by design (bot-visibility.ts:291), so each file
+    // has to become a reference before the neighbour asks for it. The avatar is the reference that lands the moment the
+    // PATCH answers: a transcript message only reaches the thread when the bot's turn drains, and a seeded tenant has no
+    // engine to answer, so the same send would still be parked when the probes below run.
+    expect((await api("PATCH", `/api/bots/${t1.bots[0].id}`, { avatarUrl: `/api/attachments/${mine.name}` }, OPS)).status).toBe(200);
+    expect((await api("PATCH", `/api/bots/${t2.bots[0].id}`, { avatarUrl: `/api/attachments/${foreign.name}` }, OPS)).status).toBe(200);
+    expect((await api("GET", `/api/attachments/${mine.name}`, undefined, T1)).status).toBe(200);
+    expect((await api("GET", `/api/attachments/${foreign.name}`, undefined, T2)).status).toBe(200);
+    expect((await api("GET", `/api/attachments/${foreign.name}`, undefined, T1)).status).toBe(404);
+    expect((await api("GET", `/api/attachments/${mine.name}`, undefined, T2)).status).toBe(404);
+  });
+
+  it("delivers no foreign event, on a live stream or from the replay buffer", async () => {
+    const ownWord = "leak-check-daffodil";
+    const foreignWord = "leak-check-marigold";
+    // A cursor from a stream that opened now, before either message, so both fall inside what a resume replays. It must
+    // be the `<stream>:<seq>` the server wrote in its hello: a bare number reads to index.ts:4742 as no cursor at all.
+    const hello = await streamText(T1, 1_000);
+    const cursor = /"cursor":"([^"]+)"/.exec(hello)?.[1] ?? "";
+    expect(cursor, "the event stream never opened, so nothing below was tested").toBeTruthy();
+
+    const live = streamText(T1, 4_000);
+    expect((await api("POST", `/api/bots/${t1.bots[0].id}/messages`, { text: ownWord }, T1)).status).toBe(202);
+    expect((await api("POST", `/api/bots/${t2.bots[0].id}/messages`, { text: foreignWord }, OPS)).status).toBe(202);
+    const streamed = await live;
+    expect(streamed, "a stream that did not carry its own tenant's message would make the line below vacuous").toContain(ownWord);
+    expect(streamed).not.toContain(foreignWord);
+
+    const replay = await streamText(T1, 3_000, cursor);
+    expect(replay, "a replay that carried nothing, not even the caller's own message, would prove nothing either").toContain(ownWord);
+    expect(replay).not.toContain(foreignWord);
+  });
+
+  it("hides foreign routines, notifications, webhooks and the team map", async () => {
+    for (const path of ["/api/routines", "/api/notifications", "/api/team-map", "/api/webhooks"]) {
+      const answer = await api("GET", path, undefined, T1);
+      // A refusal would answer with an error body and make the two lines below pass on their own.
+      expect(answer.status, path).toBe(200);
+      const body = JSON.stringify(answer.body ?? null);
+      for (const bot of t2.bots) expect(body, `${path} ${bot.name}`).not.toContain(bot.id);
+      for (const group of t2.groups) expect(body, `${path} ${group.name}`).not.toContain(group.id);
+      expect(body, path).not.toContain(SECRET);
+    }
+  });
+
+  it("gives an admitted tenant with no agents nothing at all", async () => {
+    // IDLE is in signIn.members but owns no row: the one case the visibility filter answers with an empty set rather
+    // than a refusal. It also fails loudly if any bot on the server is loose, which is the property below pins.
+    const listed = await api("GET", "/api/bots?messages=0", undefined, IDLE);
+    expect(listed.status, JSON.stringify(listed.body)).toBe(200);
+    expect(listed.body.bots).toEqual([]);
+    expect(listed.body.groups).toEqual([]);
+  });
+
+  it("leaves no unrestricted agent anywhere on a Talana-mode server", async () => {
+    // Read as the admin, whose listing carries truthful visibility: member-facing bodies are stripped
+    // (bot-visibility.ts:465 does it to audienceFloor) and a stripped field reads as absent, which would make this
+    // filter match every bot and the test pass on a broken server.
+    const listing = await api("GET", "/api/bots?messages=0", undefined, OPS);
+    const loose = listing.body.bots.filter((bot: any) => bot.visibility == null || bot.visibility === "everyone");
+    expect(loose.map((bot: any) => bot.name)).toEqual([]);
+  });
+
+  it.skip("proves /api/routines and /api/webhooks filter a foreign row — skipped: the gold-team fixture provisions no routine or webhook for either tenant, so only the absence of a foreign id is asserted above");
+  it.skip("proves a foreign upload nothing references is refused — skipped: an unreferenced attachment is served to any signed-in caller by design (bot-visibility.ts:291); the referenced half is asserted above");
+  it.skip("proves GET /api/bots/:id and GET /api/groups/:id answer 404 for a foreign row — skipped: neither is a route, and index.ts:15436 answers every unhandled path with 404, so the probe would pass on a server with no isolation at all");
 });
