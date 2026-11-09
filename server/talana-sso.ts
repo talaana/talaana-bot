@@ -5,9 +5,10 @@
  * Flow: Talana token → validate via Talana API → issue OpenMausBot session.
  *
  * Role mapping:
- *   Talana superadmin  → OpenMausBot ["admin", "client"]
- *   Talana tenant_admin → OpenMausBot ["admin", "client"]
- *   Talana user         → OpenMausBot ["client"]
+ *   Talana superadmin (role slug `superadmin`) → OpenMausBot ["admin", "client"]
+ *   every other Talana role                    → OpenMausBot ["client"]
+ * A tenant's own admin is deliberately NOT a platform admin: `admin` is the one scope that sees
+ * every customer's configuration (host/visibility-host.ts:24), so it would read their rooms too.
  *
  * Environment variables:
  *   TALANA_API_URL     — Base URL of Talana backend (e.g. https://api.talaana.ir)
@@ -74,6 +75,35 @@ interface TalanaSsoError {
   ok: false;
   status: 401 | 403 | 502;
   error: string;
+}
+
+export const OPS_DOMAIN = "ops.talana.local";
+export const TALANA_ADDRESS_SUFFIX = ".talana.local";
+/** The store half of an address is always `t-<slug>`. The grammar is the bot's own, not a stricter one invented
+ * here: an audience entry must satisfy ENTRY (`bot-visibility.ts:29` — no whitespace, no `@ , ; < > "`, at least
+ * one dot in the domain) and both the entry and the session email are capped at 320 characters
+ * (`config.ts:327`, `sessions.ts:69`). Talana's slug rule (`^[a-z0-9_-]+$`, TenantController::store) sits inside
+ * that set, so every tenant Talana can create has an address and onboarding can never be locked out by its own
+ * slug. A slug that is empty, carries a character ENTRY forbids or holds a control character composes to nothing — refuse it.
+ * Laravel's mirror is App\Services\Bot\BotAddress::tenantDomain(); neither side may drift. */
+const ENTRY_UNSAFE = /[\s@,;<>"]|[\p{Cc}]/u;
+export const MAX_ADDRESS_LENGTH = 320;
+export const tenantLabel = (slug: string): string => `t-${slug}`;
+
+/** The synthetic address a Talana person owns inside the bot. Stable for the same (user, tenant) pair, so rooms,
+ * chats and memory survive re-logins, re-pairing and client reinstalls; two tenants mean two identities on purpose. */
+export function talanaAddress(input: {
+  userId: number;
+  superadmin: boolean;
+  tenantSlug?: string | null;
+}): { ok: true; email: string } | { ok: false; error: string } {
+  if (!Number.isInteger(input.userId) || input.userId < 1) return { ok: false, error: "Talana reported an unusable user id." };
+  if (input.superadmin) return { ok: true, email: `u${input.userId}@${OPS_DOMAIN}` };
+  const label = tenantLabel((input.tenantSlug ?? "").trim().toLowerCase());
+  if (label === "t-" || ENTRY_UNSAFE.test(label)) return { ok: false, error: "This Talana account is not attached to a store." };
+  const email = `u${input.userId}@${label}${TALANA_ADDRESS_SUFFIX}`;
+  if (email.length > MAX_ADDRESS_LENGTH) return { ok: false, error: "This Talana account's store name is too long to sign in with." };
+  return { ok: true, email };
 }
 
 /**
@@ -176,16 +206,21 @@ export async function handleTalanaSso(
   const { profile, permissions } = validated;
   const scopes = mapTalanaRoleToScopes(permissions);
 
-  // Talana vouches for this identity, so the session carries a userId instead of an email. OpenMausBot revokes
-  // every emailed session whose address is missing from its own sign-in allowlist, and it rechecks on each request.
-  const userId = `talana:${profile.user.id}`;
-  const label = `Talana SSO: ${profile.user.name}`;
+  const address = talanaAddress({
+    userId: profile.user.id,
+    superadmin: permissions.is_superadmin,
+    tenantSlug: permissions.tenant?.slug ?? null,
+  });
+  // No address means no membership and no audience: the allowlist is the kill switch, and a session that cannot be
+  // named by it must not exist. Talana's own membership pivot is therefore what removal leans on.
+  if (!address.ok) return { ok: false, status: 403, error: address.error };
 
-  // Issue OpenMausBot session
+  const label = `Talana SSO: ${profile.user.name}`;
   const issued = config.sessions.issue({
     label: label.slice(0, 80),
     scopes,
-    userId,
+    userId: `talana:${profile.user.id}`,
+    email: address.email,
   });
 
   // Determine the Talana role string for the response

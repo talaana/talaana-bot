@@ -5,6 +5,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { allowedScopes, type SignInAllowList } from "./account-signin.ts";
 import { personKey } from "./person-key.ts";
 import { requiredScope, sessionCookieName } from "./request-auth.ts";
 import { SessionRegistry } from "./sessions.ts";
@@ -17,15 +18,15 @@ function profile(userId: number) {
   return { user: { id: userId, name: "مدیر طلانا", phone: "09301104108", verification_status: "verified" } };
 }
 
-const permissions = (over: { is_superadmin?: boolean; roles?: string[] } = {}) => ({
+const permissions = (over: { is_superadmin?: boolean; roles?: string[]; tenant?: { id: number; name: string; slug: string; type: string } | null } = {}) => ({
   is_superadmin: over.is_superadmin ?? false,
   permissions: [],
   roles: over.roles ?? ["tenant_admin_talana"],
-  tenant: { id: 1, name: "طلانا", slug: "talana", type: "gold" },
+  tenant: over.tenant === undefined ? { id: 1, name: "طلانا", slug: "talana", type: "gold" } : over.tenant,
 });
 
 /** Talana's two profile endpoints, answered from memory; the registry under test never sees this stub. */
-function stubTalanaApi(activeUserId: () => number, over: { is_superadmin?: boolean; roles?: string[] } = {}): () => void {
+function stubTalanaApi(activeUserId: () => number, over: { is_superadmin?: boolean; roles?: string[]; tenant?: { id: number; name: string; slug: string; type: string } | null } = {}): () => void {
   const original = globalThis.fetch;
   globalThis.fetch = async (input: string | URL | Request) =>
     new Response(
@@ -42,14 +43,21 @@ async function exchange(sessions: SessionRegistry, talanaToken: string) {
 }
 
 describe("Talana SSO sessions", () => {
-  let dir = "";
+  const dirs: string[] = [];
   let restore = () => {};
-  afterEach(async () => { restore(); if (dir) await removeTempDir(dir); dir = ""; });
+  afterEach(async () => { restore(); for (const made of dirs.splice(0)) await removeTempDir(made); });
 
-  function registry() {
-    dir = mkdtempSync(join(tmpdir(), "omb-talana-sso-"));
-    // The production state: OpenMausBot's sign-in allowlist is empty, so no email has scopes here.
-    return new SessionRegistry({ file: join(dir, "sessions.json"), emailScopes: () => null });
+  /** Production's shape: `@ops.talana.local` in admins (⇒ ["admin","client"]) and the customer's domain in
+   * members (⇒ ["client"]). `signIn.admins` never holds a customer domain: an entry there sees every tenant. */
+  function registry(allow: Partial<SignInAllowList> = {}): SessionRegistry & { allow: SignInAllowList } {
+    const dir = mkdtempSync(join(tmpdir(), "omb-talana-sso-"));
+    dirs.push(dir);
+    const state: SignInAllowList = { admins: allow.admins ?? ["@ops.talana.local"], members: allow.members ?? ["@t-talana.talana.local"] };
+    const sessions = new SessionRegistry({
+      file: join(dir, "sessions.json"),
+      emailScopesSnapshot: () => (email: string) => allowedScopes(email, state),
+    });
+    return Object.assign(sessions, { allow: state });
   }
 
   it("still authenticates after OpenMausBot rechecks email membership", async () => {
@@ -140,5 +148,89 @@ describe("Talana SSO sessions", () => {
     if (!result.ok) return;
 
     expect(sessions.authenticate(result.token)!.scopes).toContain(requiredScope("POST", "/api/teams/import"));
+  });
+
+  it("makes a tenant person one address, and platform staff another", async () => {
+    restore = stubTalanaApi(() => 7);
+    const sessions = registry();
+    const member = await exchange(sessions, "1|abc");
+    expect(member.ok).toBe(true);
+    if (!member.ok) return;
+    expect(sessions.authenticate(member.token)!.email).toBe("u7@t-talana.talana.local");
+    expect(sessions.authenticate(member.token)!.userId).toBe("talana:7");
+
+    restore();
+    restore = stubTalanaApi(() => 3, { is_superadmin: true, roles: ["superadmin"], tenant: null });
+    const ops = await exchange(sessions, "9|xyz");
+    expect(ops.ok).toBe(true);
+    if (!ops.ok) return;
+    expect(sessions.authenticate(ops.token)!.email).toBe("u3@ops.talana.local");
+  });
+
+  it("gives one person two addresses when Talana puts them in two stores", async () => {
+    restore = stubTalanaApi(() => 7);
+    const sessions = registry({ members: ["@t-talana.talana.local", "@t-arg-co.talana.local"] });
+    const first = await exchange(sessions, "1|abc");
+    restore();
+    restore = stubTalanaApi(() => 7, { tenant: { id: 4, name: "arg", slug: "arg-co", type: "gold" } });
+    const second = await exchange(sessions, "2|def");
+    expect(first.ok && second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+
+    expect(sessions.authenticate(first.token)!.email).toBe("u7@t-talana.talana.local");
+    expect(sessions.authenticate(second.token)!.email).toBe("u7@t-arg-co.talana.local");
+    expect(personKey(sessions.authenticate(first.token)!)).not.toBe(personKey(sessions.authenticate(second.token)!));
+  });
+
+  it("refuses a person Talana gives no store: no address means no audience and no membership", async () => {
+    restore = stubTalanaApi(() => 7, { tenant: null });
+    const sessions = registry();
+    const result = await exchange(sessions, "1|abc");
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.status).toBe(403);
+    expect(sessions.list()).toEqual([]);
+  });
+
+  // Not one of these is a DNS-label complaint: each breaks ENTRY's character set, the 320-character cap, or is
+  // simply no store at all. Everything Talana's own slug rule can produce that is *not* in this list must sign in.
+  it.each(["Bad Slug", "a@b", "a,b", "a;b", "a<b", `x`.repeat(318)])("refuses the store slug %j, which composes to no storable address", async (slug) => {
+    restore = stubTalanaApi(() => 7, { tenant: { id: 4, name: "x", slug, type: "gold" } });
+    const sessions = registry();
+    const result = await exchange(sessions, "1|abc");
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.status).toBe(403);
+    expect(sessions.list()).toEqual([]);
+  });
+
+  it("signs in the slugs Talana is allowed to create, underscore and hyphen included", async () => {
+    for (const slug of ["gold_shop", "gold-shop", "golshahr2", "a"]) {
+      restore = stubTalanaApi(() => 7, { tenant: { id: 4, name: "x", slug, type: "gold" } });
+      const sessions = registry({ members: [`@t-${slug}.talana.local`] });
+      const result = await exchange(sessions, "1|abc");
+      restore();
+      expect(result.ok, `slug ${slug} must have an address`).toBe(true);
+      if (!result.ok) continue;
+      expect(sessions.authenticate(result.token)!.email).toBe(`u7@t-${slug}.talana.local`);
+    }
+  });
+
+  // Offboarding is the feature: the customer's domain in `members` keeps every one of its people signed in, and
+  // removing it revokes them on their next request.
+  it("keeps a tenant signed in while its domain is on the list, and revokes the moment it is not", async () => {
+    restore = stubTalanaApi(() => 7);
+    const sessions = registry();
+    const result = await exchange(sessions, "1|abc");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    sessions.revalidateEmailSessions();
+    expect(sessions.authenticate(result.token)).not.toBeNull();
+
+    sessions.allow.members = [];
+    sessions.membershipChanged();
+    sessions.revalidateEmailSessions();
+    expect(sessions.authenticate(result.token)).toBeNull();
   });
 });
