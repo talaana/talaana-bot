@@ -334,4 +334,24 @@ describe("Talana SSO sessions", () => {
     const sessions = registry();
     expect(() => sessions.openPairing({ scopes: ["client"], address: "u99@t-other.talana.local" })).toThrow();
   });
+
+  // A scope-less code minted for an address asks the sign-in list for its scopes, so the list's grant is the only
+  // authority over what the paired device can do: it must never fall back to the full scope set the caller did not ask for.
+  it("gives a scope-less code for an address exactly what the sign-in list grants it", () => {
+    const sessions = registry();
+    const address = "u7@t-talana.talana.local";
+    const granted = allowedScopes(address, sessions.allow);
+    expect(granted).toEqual(["client"]);
+
+    const opened = sessions.openPairing({ label: "Phone", address });
+    const redeemed = sessions.exchange({ code: opened.code, label: "Pixel", source: "198.51.100.9" });
+    expect(redeemed.ok).toBe(true);
+    if (!redeemed.ok) return;
+
+    const session = sessions.authenticate(redeemed.token);
+    expect(session).not.toBeNull();
+    if (!session) return;
+    expect(session.scopes).toEqual(granted);
+    expect(session.scopes).not.toContain("admin");
+  });
 });
