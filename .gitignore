@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dist-server/
+dist-companion/
+dist.bak-*/
+data/
+logs/
+docs/
+enterprise/
+*.tsbuildinfo
+.DS_Store
+
+# Production deployment config imported by the baseline tar (state/secrets) — never commit.
+# .env.example templates remain tracked: they hold only placeholders/defaults, no credentials.
+.env

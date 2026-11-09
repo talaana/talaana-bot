@@ -14,12 +14,18 @@
  *   TALANA_SSO_SECRET  — Shared secret for server-to-server verification (optional, for future HMAC)
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { serializeSessionCookie } from "./request-auth.ts";
 import type { SessionRegistry, Scope } from "./sessions.ts";
 
 export interface TalanaSsoConfig {
   talanaApiUrl: string;
   ssoSecret?: string;
   sessions: SessionRegistry;
+  /** The server's own cookie name, from `sessionCookieName(PORT, ENVIRONMENT_ID)`: a cookie the browser sends back
+   * must be the one `resolveRequestAuth` reads. */
+  cookieName: string;
+  /** The server's own `Secure` rule, so the exchange cannot drop a cookie the rest of the app would have kept. */
+  cookieSecure: (req: IncomingMessage) => boolean;
 }
 
 interface TalanaProfileResponse {
@@ -117,10 +123,12 @@ async function validateTalanaToken(
 
 /**
  * Map Talana user roles to OpenMausBot scopes.
+ *
+ * Only Talana's own platform super-admin gets `admin`: one scope grants the routes every customer's
+ * configuration lives behind, so a tenant's admin would otherwise administer — and see — every tenant.
  */
 function mapTalanaRoleToScopes(permissions: TalanaPermissionsResponse): Scope[] {
   if (permissions.is_superadmin) return ["admin", "client"];
-  if (permissions.roles.includes("tenant_admin")) return ["admin", "client"];
   return ["client"];
 }
 
@@ -168,9 +176,9 @@ export async function handleTalanaSso(
   const { profile, permissions } = validated;
   const scopes = mapTalanaRoleToScopes(permissions);
 
-  // Build a stable userId from Talana user ID
+  // Talana vouches for this identity, so the session carries a userId instead of an email. OpenMausBot revokes
+  // every emailed session whose address is missing from its own sign-in allowlist, and it rechecks on each request.
   const userId = `talana:${profile.user.id}`;
-  const email = `${profile.user.phone}@talana.local`;
   const label = `Talana SSO: ${profile.user.name}`;
 
   // Issue OpenMausBot session
@@ -178,7 +186,6 @@ export async function handleTalanaSso(
     label: label.slice(0, 80),
     scopes,
     userId,
-    email,
   });
 
   // Determine the Talana role string for the response
@@ -220,19 +227,10 @@ export function createTalanaSsoHandler(config: TalanaSsoConfig) {
     const result = await handleTalanaSso(req, config, readBody);
 
     if (result.ok) {
-      // Set session cookie for browser-based access
-      const secure = true; // Always secure in production (behind nginx TLS)
-      const maxAge = Math.max(1, Math.floor((result.session.expiresAt - Date.now()) / 1000));
-      const cookieName = `omb_session_${process.env.OMB_HTTP_PORT ?? "8080"}_${(process.env.OMB_ENVIRONMENT_ID ?? "default").replace(/[^a-z0-9]/gi, "").slice(0, 12)}`;
-      const parts = [
-        `${cookieName}=${result.token}`,
-        "Path=/",
-        "HttpOnly",
-        "SameSite=Lax",
-        `Max-Age=${maxAge}`,
-      ];
-      if (secure) parts.push("Secure");
-      res.setHeader("set-cookie", parts.join("; "));
+      const maxAgeSeconds = Math.max(1, Math.floor((result.session.expiresAt - Date.now()) / 1000));
+      res.setHeader("set-cookie", serializeSessionCookie(config.cookieName, result.token, {
+        secure: config.cookieSecure(req), maxAgeSeconds,
+      }));
 
       json(res, 200, {
         session: result.session,

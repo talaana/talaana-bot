@@ -1,0 +1,26 @@
+module.exports = {
+  apps: [{
+    name: 'talana-bot',
+    script: 'dist-server/openmausbot.js',
+    args: 'serve',
+    cwd: '/home/talana/www/talaana-bot',
+    node_args: '--max-old-space-size=512',
+    env: {
+      NODE_ENV: 'production',
+      OMB_HTTP_PORT: '8080',
+      OMB_BIND_ADDRESS: '127.0.0.1',
+      OMB_PUBLIC_URL: 'https://bot.talaana.ir',
+      OMB_SERVER_NAME: 'Talana Bot',
+      TALANA_API_URL: 'https://api.talaana.ir',
+      OPENCODE_PROVIDER: 'mock',
+      OMB_DATA_DIR: '/home/talana/www/talaana-bot/data',
+    },
+    instances: 1,
+    autorestart: true,
+    watch: false,
+    max_memory_restart: '512M',
+    error_file: '/home/talana/www/talaana-bot/logs/error.log',
+    out_file: '/home/talana/www/talaana-bot/logs/out.log',
+    merge_logs: true,
+  }],
+};
