@@ -9,7 +9,7 @@ import { allowedScopes, type SignInAllowList } from "./account-signin.ts";
 import { personKey } from "./person-key.ts";
 import { requiredScope, sessionCookieName } from "./request-auth.ts";
 import { SessionRegistry } from "./sessions.ts";
-import { createTalanaSsoHandler, handleTalanaSso, talanaAddress } from "./talana-sso.ts";
+import { createTalanaSsoHandler, handleTalanaSso, MAX_ADDRESS_LENGTH, TALANA_ADDRESS_SUFFIX, talanaAddress, tenantLabel } from "./talana-sso.ts";
 import { removeTempDir } from "./testing/cleanup.ts";
 
 const TALANA_API_URL = "https://api.talaana.ir";
@@ -228,10 +228,45 @@ describe("Talana SSO sessions", () => {
     }
   });
 
+  // The cap counts the whole composed address, so the longest legal slug is what the id, the label and the
+  // suffix leave over.
+  it("accepts an address of exactly the cap and refuses one character past it", () => {
+    const head = `u7@${tenantLabel("")}`;
+    const slugAtCap = "x".repeat(MAX_ADDRESS_LENGTH - head.length - TALANA_ADDRESS_SUFFIX.length);
+    const atCap = talanaAddress({ userId: 7, superadmin: false, tenantSlug: slugAtCap });
+    expect(atCap.ok).toBe(true);
+    if (!atCap.ok) return;
+    expect(atCap.email).toBe(`${head}${slugAtCap}${TALANA_ADDRESS_SUFFIX}`);
+    expect(atCap.email.length).toBe(MAX_ADDRESS_LENGTH);
+
+    expect(talanaAddress({ userId: 7, superadmin: false, tenantSlug: `${slugAtCap}x` }))
+      .toEqual({ ok: false, error: "This Talana account's store name is too long to sign in with." });
+  });
+
   // A session is keyed by its address, so an id that is not a person's would hand one identity to several people.
   it.each([0, -1, 2.5, Number.NaN])("refuses the Talana user id %s", (userId) => {
     for (const superadmin of [false, true]) {
       expect(talanaAddress({ userId, superadmin, tenantSlug: "talana" }))
+        .toEqual({ ok: false, error: "Talana reported an unusable user id." });
+    }
+  });
+
+  // Talana's JSON is not validated at runtime, so an id can arrive as a numeric string and a real person is
+  // behind it. It is coerced before it is tested, and the coerced value names both address forms: interpolating
+  // the raw string would put its padding characters into an audience entry that core's ENTRY rule then refuses.
+  it("signs in a Talana user id that arrives as a string", () => {
+    for (const userId of ["7", " 7 ", 7] as (string | number)[]) {
+      expect(talanaAddress({ userId: userId as number, superadmin: false, tenantSlug: "talana" }))
+        .toEqual({ ok: true, email: "u7@t-talana.talana.local" });
+      expect(talanaAddress({ userId: userId as number, superadmin: true }))
+        .toEqual({ ok: true, email: "u7@ops.talana.local" });
+    }
+  });
+
+  // Coercion is not permission: only a whole positive id can be one person's.
+  it.each(["abc", "", " ", "7.5"])("refuses the Talana user id %j", (userId) => {
+    for (const superadmin of [false, true]) {
+      expect(talanaAddress({ userId: userId as unknown as number, superadmin, tenantSlug: "talana" }))
         .toEqual({ ok: false, error: "Talana reported an unusable user id." });
     }
   });

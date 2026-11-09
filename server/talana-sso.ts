@@ -5,8 +5,8 @@
  * Flow: Talana token → validate via Talana API → issue OpenMausBot session.
  *
  * Role mapping:
- *   Talana superadmin (role slug `superadmin`) → OpenMausBot ["admin", "client"]
- *   every other Talana role                    → OpenMausBot ["client"]
+ *   Talana superadmin (`is_superadmin` true — not its role slug) → OpenMausBot ["admin", "client"]
+ *   every other Talana role                                     → OpenMausBot ["client"]
  * A tenant's own admin is deliberately NOT a platform admin: `admin` is the one scope that sees
  * every customer's configuration (host/visibility-host.ts:24), so it would read their rooms too.
  *
@@ -84,9 +84,10 @@ export const TALANA_ADDRESS_SUFFIX = ".talana.local";
  * one dot in the domain) and both the entry and the session email are capped at 320 characters
  * (`config.ts:327`, `sessions.ts:69`). Talana's slug rule (`^[a-z0-9_-]+$`, TenantController::store) sits inside
  * that set, so every tenant Talana can create has an address and onboarding can never be locked out by its own
- * slug. What is refused is an empty slug, a character ENTRY forbids, or a composed address over the cap — the same
- * three and only those Laravel's mirror App\Services\Bot\BotAddress::tenantDomain() refuses; neither side may
- * drift. */
+ * slug. What is refused is an empty slug, a character ENTRY forbids, or a composed address over the cap — all
+ * three tested on the slug after it is trimmed and lowercased, and Laravel's mirror
+ * App\Services\Bot\BotAddress::tenantDomain() must refuse the same three on the same normalization: neither side
+ * may drift. */
 const ENTRY_UNSAFE = /[\s@,;<>"]/;
 export const MAX_ADDRESS_LENGTH = 320;
 export const tenantLabel = (slug: string): string => `t-${slug}`;
@@ -98,11 +99,12 @@ export function talanaAddress(input: {
   superadmin: boolean;
   tenantSlug?: string | null;
 }): { ok: true; email: string } | { ok: false; error: string } {
-  if (!Number.isInteger(input.userId) || input.userId < 1) return { ok: false, error: "Talana reported an unusable user id." };
-  if (input.superadmin) return { ok: true, email: `u${input.userId}@${OPS_DOMAIN}` };
-  const label = tenantLabel((input.tenantSlug ?? "").trim().toLowerCase());
-  if (label === "t-" || ENTRY_UNSAFE.test(label)) return { ok: false, error: "This Talana account is not attached to a store." };
-  const email = `u${input.userId}@${label}${TALANA_ADDRESS_SUFFIX}`;
+  const id = Number(input.userId);
+  if (!Number.isInteger(id) || id < 1) return { ok: false, error: "Talana reported an unusable user id." };
+  if (input.superadmin) return { ok: true, email: `u${id}@${OPS_DOMAIN}` };
+  const slug = (input.tenantSlug ?? "").trim().toLowerCase();
+  if (slug === "" || ENTRY_UNSAFE.test(slug)) return { ok: false, error: "This Talana account is not attached to a store." };
+  const email = `u${id}@${tenantLabel(slug)}${TALANA_ADDRESS_SUFFIX}`;
   if (email.length > MAX_ADDRESS_LENGTH) return { ok: false, error: "This Talana account's store name is too long to sign in with." };
   return { ok: true, email };
 }
