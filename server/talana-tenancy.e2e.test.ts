@@ -205,18 +205,17 @@ describe("Talana cross-tenant leak surfaces", () => {
   // Planted in tenant B's transcript, because every probe below is made as tenant A: each test then carries the control
   // that shows the tenant holding the row really does see it.
   const SECRET = "the-shall-not-be-read-seal";
+  const LISTS = { admins: ["@ops.talana.local"], members: ["@t-talana.talana.local", "@t-arg.talana.local", "@t-idle.talana.local"] };
   let t1: Awaited<ReturnType<typeof seedTenant>>, t2: Awaited<ReturnType<typeof seedTenant>>;
   /** A bot's own conversation, read from the admin's listing: `GET /api/bots/:id` is not a route on this server. */
   const threads: Record<string, string> = {};
 
-  beforeAll(async () => {
-    home = mkdtempSync(join(tmpdir(), "omb-talana-leak-"));
-    const data = join(home, ".openmausbot");
-    mkdirSync(data, { recursive: true });
-    const LISTS = { admins: ["@ops.talana.local"], members: ["@t-talana.talana.local", "@t-arg.talana.local", "@t-idle.talana.local"] };
-    writeFileSync(join(data, "config.json"), JSON.stringify({ signIn: LISTS }));
+  /** Writes the bearers every probe below signs with into the store the server reads. A restart needs it: a SIGTERM
+   * sent to a Windows child is TerminateProcess, so the server's shutdown never runs, its `sessions.json.open` marker
+   * survives, and the next boot drops the stored sessions that carry an email (sessions.ts `load(!unclean)`). */
+  const reissue = () => {
     const registry = new SessionRegistry({
-      file: join(data, "sessions.json"),
+      file: join(home, ".openmausbot", "sessions.json"),
       emailScopesSnapshot: () => (email: string) => allowedScopes(email, LISTS),
       recheckMs: 1_000,
     });
@@ -229,6 +228,14 @@ describe("Talana cross-tenant leak surfaces", () => {
       tokens[email] = registry.issue({ label: email, email, scopes: scopes! }).token;
     }
     registry.close();
+  };
+
+  beforeAll(async () => {
+    home = mkdtempSync(join(tmpdir(), "omb-talana-leak-"));
+    const data = join(home, ".openmausbot");
+    mkdirSync(data, { recursive: true });
+    writeFileSync(join(data, "config.json"), JSON.stringify({ signIn: LISTS }));
+    reissue();
     await start({ talanaMode: true });
 
     t1 = await seedTenant(OPS, "talana");
@@ -440,6 +447,111 @@ describe("Talana cross-tenant leak surfaces", () => {
     expect(starter.map((bot: any) => bot.name)).toEqual(["MausBot"]);
     expect(starter[0].visibility).toEqual({ people: ["@ops.talana.local"] });
   });
+
+  it("refuses a member a pairing code that carries someone else's address", async () => {
+    // `pairingRequest()` (sessions.ts:207) reads `address` and `scopes` off the body; anything else it drops silently
+    // and the guard below never sees an address to guard.
+    const asAdmin = await api("POST", "/api/auth/pairing", { address: OPS, scopes: ["client"] }, OPS);
+    expect(asAdmin.status, JSON.stringify(asAdmin.body)).toBe(200);
+    // The address really rides the code: exchanging it opens a session for that person, with the scopes the body asked
+    // for rather than the ["admin","client"] the ops address is admitted with.
+    const exchanged = await api("POST", "/api/auth/pair", { code: asAdmin.body.code as string });
+    expect(exchanged.status, JSON.stringify(exchanged.body)).toBe(200);
+    expect(exchanged.body.session.email).toBe(OPS);
+    expect(exchanged.body.session.scopes).toEqual(["client"]);
+
+    const asMember = await api("POST", "/api/auth/pairing", { address: OPS, scopes: ["client"] }, T1);
+    expect(asMember.status, JSON.stringify(asMember.body)).toBe(403);
+    expect(JSON.stringify(asMember.body)).not.toContain("credential");
+    // Which gate answered matters, so the next line asks for a code with no address in it and is refused again:
+    // POST /api/auth/pairing is on no client allow list (CLIENT_ALLOW, request-auth.ts:292), so a member session is
+    // refused the whole route before the address check (index.ts:12811) reads the body. The address check is a second
+    // gate behind a route a member cannot reach, and no member leaves this server holding a code for anyone.
+    expect((await api("POST", "/api/auth/pairing", { scopes: ["client"] }, T1)).status).toBe(403);
+  });
+
+  it("never widens a room's audience when the agents it is made of move to another tenant", async () => {
+    // Spec §11.3. Read the floor as the admin: `memberGroup()` (bot-visibility.ts:465) strips `audienceFloor` from
+    // every member-facing group body, and a member read of `undefined` against `undefined ?? "everyone"` is a test
+    // that cannot fail. The room is found by the id the import returned rather than by name, because a test above it
+    // renames one of tenant A's rooms and both tenants seed the same package.
+    const listed = await api("GET", "/api/bots?messages=0", undefined, OPS);
+    const seeded = t1.groups.find((group) => group.name === "اتاق نرخ");
+    expect(seeded, "the gold package provisions no rate room").toBeTruthy();
+    const room = listed.body.groups.find((group: any) => group.id === seeded!.id);
+    expect(room, "the seeded rate room is not on this server").toBeTruthy();
+    expect(room.audienceFloor, "an admin read must carry the field, or there is nothing to compare").toBeTruthy();
+    const floorBefore = JSON.stringify(room.audienceFloor);
+    // Every member moves, so afterwards tenant B holds all of the room's agents and only the floor stands between it
+    // and the transcript: a room one of whose members stays behind is hidden by VisibleSet.group's own member check
+    // (bot-visibility.ts:236) whatever its floor says, and a test that stops at that check never reads the floor.
+    const members = room.memberIds.filter((id: string) => t1.bots.some((bot) => bot.id === id));
+    expect(members.length, "the rate room holds no agent of tenant A to move").toBe(room.memberIds.length);
+
+    const seenBy = async (as: string) => (await api("GET", "/api/bots?messages=0", undefined, as)).body.groups.map((group: any) => group.id);
+    // Which side of the floor each neighbour stands on before anything moves.
+    expect(await seenBy(T1), "the tenant the floor names does not hold its own room").toContain(room.id);
+    expect(await seenBy(T2), "tenant B already holds a room it was never in the floor of").not.toContain(room.id);
+
+    for (const id of members) {
+      expect((await api("PATCH", `/api/bots/${id}`, { visibility: { people: ["@t-arg.talana.local"] } }, OPS)).status, id).toBe(200);
+    }
+
+    // `settleRoomFloor` runs off the store change, after the PATCH has answered, so the floor is waited for rather than
+    // assumed: reading it immediately could show the old value and pass while nothing re-settled the room at all.
+    const settled = await waitFor(async () => {
+      const moved = (await api("GET", "/api/bots?messages=0", undefined, OPS)).body.groups.find((group: any) => group.id === room.id);
+      return JSON.stringify(moved?.audienceFloor ?? "everyone") !== floorBefore ? moved : null;
+    });
+    expect(settled, `the room's floor never moved from ${floorBefore} when its members left: nothing re-settled it`).toBeTruthy();
+
+    // Widening is the bug. Two addresses stood outside the floor before the move and must stand outside it after: the
+    // room cannot follow the agents that carried it into tenant B.
+    expect(await seenBy(T2), "the room followed its members into tenant B").not.toContain(room.id);
+    expect(await seenBy(IDLE), "a tenant that owns nothing reads a room it never held").not.toContain(room.id);
+    expect((await api("GET", `/api/threads/${room.threadId}/messages`, undefined, T2)).status).toBe(404);
+
+    // The route the 404 above is read from does answer for a room tenant B holds outright.
+    const theirs = listed.body.groups.find((group: any) => group.id === t2.groups.find((group) => group.name === "اتاق نرخ")?.id);
+    expect(theirs, "tenant B's own rate room is not on this server").toBeTruthy();
+    expect((await api("GET", `/api/threads/${theirs!.threadId}/messages`, undefined, T2)).status).toBe(200);
+
+    // And each agent that moved takes its own conversation with it: the by-id read this server really has, both ways.
+    for (const id of members) {
+      expect((await api("GET", `/api/threads/${threads[id]}/messages`, undefined, T1)).status, id).toBe(404);
+      expect((await api("GET", `/api/threads/${threads[id]}/messages`, undefined, T2)).status, id).toBe(200);
+    }
+  });
+
+  it("re-derives every room's audience floor at boot from the stored agents", async () => {
+    // `home` is made once by this describe and `start()` only spawns, so the restarted server reads the records below.
+    await waitForExit(child, { signal: "SIGTERM" });
+    const groupsFile = join(home, ".openmausbot", "groups.json");
+    const stored = JSON.parse(readFileSync(groupsFile, "utf8")) as any[];
+    const rooms = stored.filter((group) => !group.dm);
+    expect(rooms.length, "the two seeded tenants left no rooms to restart").toBeGreaterThan(1);
+    for (const room of rooms) expect(room.audienceFloor, `${room.name} stored no floor`).toBeTruthy();
+    // The floors go, the agents keep their visibility: whatever the listing carries after this boot is derived at
+    // start (index.ts:15464), not read back from a floor the previous process wrote.
+    for (const room of rooms) delete room.audienceFloor;
+    writeFileSync(groupsFile, JSON.stringify(stored));
+    reissue();
+    await start({ talanaMode: true });
+
+    const after = await api("GET", "/api/bots?messages=0", undefined, OPS);
+    expect(after.status, JSON.stringify(after.body)).toBe(200);
+    for (const group of after.body.groups) {
+      if (group.dm) continue;
+      expect(group.audienceFloor ?? "everyone", `${group.name} booted with no audience floor`).not.toBe("everyone");
+    }
+    const stayedId = t1.groups.find((group) => group.name === "اتاق موجودی")?.id;
+    expect(stayedId, "the gold package provisions no stock room").toBeTruthy();
+    const stayed = after.body.groups.find((group: any) => group.id === stayedId);
+    expect(stayed, "tenant A's stock room did not survive the restart").toBeTruthy();
+    expect(stayed.audienceFloor, "the room whose agents never moved came back with a floor they do not say").toEqual({ people: [TALANA_DOMAIN] });
+    // The derived floor is enforced, not decorative: the neighbouring tenant is still out of that room's transcript.
+    expect((await api("GET", `/api/threads/${stayed.threadId}/messages`, undefined, T2)).status).toBe(404);
+  }, 180_000);
 
   it.skip("proves a foreign upload nothing references is refused — skipped: an unreferenced attachment is served to any signed-in caller by design (bot-visibility.ts:291); the referenced half is asserted above");
   it.skip("proves GET /api/bots/:id and GET /api/groups/:id answer 404 for a foreign row — skipped: neither is a route, and index.ts:15436 answers every unhandled path with 404, so the probe would pass on a server with no isolation at all");
