@@ -2884,6 +2884,8 @@ for (const pending of startupCatalogs) {
     broadcast({ kind: "config", ...configStatus() });
   }, () => {});
 }
+// The "@" is load-bearing: OPS_DOMAIN carries none, and a visibility entry that fails ENTRY makes storedVisibility
+// fail closed to "admins" — the helper would become staff-by-scope while isolation still looked intact.
 const firstHourFresh = Boolean(CLOUD_PERSONAL) && store.needsSeed(); testedAi.seed({ defaultBot: !CLOUD_TEAM, ...(firstHourFresh ? { intro: (bot) => greetingMessage(bot, { name: cfg.profile?.name }, cfg.language) } : {}) }); moveFreeze.hold(() => { if (!CLOUD_TEAM) { const place = ensureDefaultBot(store, { dataDir: DATA_DIR }); if (place && process.env.TALANA_API_URL) store.patchBot(place.id, { visibility: { people: [`@${OPS_DOMAIN}`] } }); } }, () => {}); if (CLOUD_TEAM) readTeamRolesWith((email) => sessions.list().filter((session) => session.email?.toLowerCase() === email && session.teamRole).sort((a, b) => b.createdAt - a.createdAt)[0]?.teamRole ?? null); if (CLOUD_TEAM) void mausbotOwnChat.claimAll();
 hostedModels?.reconcile(store);
 if (skillsLibraryEnabled(cfg)) {

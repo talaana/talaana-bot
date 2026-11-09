@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -41,6 +42,9 @@ const api = async (method: string, path: string, body?: unknown, as?: string): P
 async function start(options?: { talanaMode?: boolean }) {
   const port = await freePortBlock([0, 1]);
   BASE = `http://127.0.0.1:${port}`;
+  // Both describes boot a server with this one helper, and a failure quotes `log`. Left carrying the first server's
+  // output, it would show the wrong boot in the second describe's message.
+  log = "";
   child = spawn(process.execPath, ["--import", pathToFileURL(join(SERVER_DIR, "testing", "hold-search-result.ts")).href, join(SERVER_DIR, "index.ts")], {
     cwd: join(SERVER_DIR, ".."),
     env: {
@@ -231,7 +235,12 @@ describe("Talana cross-tenant leak surfaces", () => {
     t2 = await seedTenant(OPS, "arg");
     expect(t1.status, JSON.stringify(t1)).toBe(201);
     expect(t2.status, JSON.stringify(t2)).toBe(201);
-    expect(t1.bots.map((bot) => bot.id)).not.toEqual(expect.arrayContaining(t2.bots.map((bot) => bot.id)));
+    const t1Ids = t1.bots.map((bot) => bot.id);
+    const t2Ids = t2.bots.map((bot) => bot.id);
+    // A shared id would make every probe below test one row twice rather than two tenants.
+    expect(t1Ids.some((id) => t2Ids.includes(id))).toBe(false);
+    expect(t1Ids.length).toBeGreaterThan(0);
+    expect(t2Ids.length).toBeGreaterThan(0);
     for (const row of (await api("GET", "/api/bots?messages=0", undefined, OPS)).body.bots) threads[row.id] = row.threadId;
     for (const bot of [...t1.bots, ...t2.bots]) expect(threads[bot.id], `${bot.name} has no conversation to leak`).toBeTruthy();
 
@@ -288,6 +297,11 @@ describe("Talana cross-tenant leak surfaces", () => {
     expect(foreign.status, JSON.stringify(foreign.body)).toBe(403);
     const own = await api("DELETE", `/api/bots/${t1.bots[0].id}`, undefined, T1);
     expect(own.status, JSON.stringify(own.body)).toBe(403);
+    // A row that does not exist either: the same refusal for the three of them is what makes the foreign 403 above say
+    // "you may not delete anything", rather than telling a member which agent ids this server happens to hold.
+    const ghost = await api("DELETE", `/api/bots/${randomUUID()}`, undefined, T1);
+    expect(ghost.status, JSON.stringify(ghost.body)).toBe(403);
+    expect(ghost.body).toEqual(foreign.body);
     const rows = (await api("GET", "/api/bots?messages=0", undefined, OPS)).body.bots.map((bot: any) => bot.id);
     expect(rows).toContain(t2.bots[0].id);
   });
@@ -345,10 +359,52 @@ describe("Talana cross-tenant leak surfaces", () => {
     expect(replay).not.toContain(foreignWord);
   });
 
-  it("hides foreign routines, notifications, webhooks and the team map", async () => {
-    for (const path of ["/api/routines", "/api/notifications", "/api/team-map", "/api/webhooks"]) {
+  it("hides a foreign routine and webhook from the lists that name them", async () => {
+    // Rows planted here rather than assumed from the fixture: the gold team provisions no routine and no webhook for
+    // either tenant, so without these the assertions below would only report that two stores were empty. Both tenants
+    // get one, because a listing that dropped everything would otherwise read as isolation too.
+    const schedule = { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 86_400_000 };
+    const planted = async (path: string, body: Record<string, unknown>) => {
+      const made = await api("POST", path, body, OPS);
+      expect(made.status, `${path}: ${JSON.stringify(made.body)}`).toBe(201);
+      return path === "/api/routines" ? (made.body.routine.id as string) : (made.body.webhook.id as string);
+    };
+    const foreignRoutine = await planted("/api/routines", { name: "Arg rate sweep", botId: t2.bots[0].id, enabled: false, schedule,
+      prompt: `Summarise the rate sheet and repeat the word ${SECRET}.` });
+    const foreignWebhook = await planted("/api/webhooks", { name: "Arg payroll feed", botId: t2.bots[0].id, enabled: false,
+      prompt: `Read the payroll event and repeat the word ${SECRET}.` });
+    const ownRoutine = await planted("/api/routines", { name: "Talana rate sweep", botId: t1.bots[0].id, enabled: false, schedule,
+      prompt: "Summarise the daily sheet." });
+    const ownWebhook = await planted("/api/webhooks", { name: "Talana rate feed", botId: t1.bots[0].id, enabled: false,
+      prompt: "Read the rate event." });
+
+    for (const [path, foreign, own] of [["/api/routines", foreignRoutine, ownRoutine], ["/api/webhooks", foreignWebhook, ownWebhook]] as const) {
+      const listed = async (as: string) => {
+        const answer = await api("GET", path, undefined, as);
+        // A refusal would answer with an error body, and the lines below would pass on their own.
+        expect(answer.status, `${path} as ${as}: ${JSON.stringify(answer.body)}`).toBe(200);
+        return JSON.stringify(answer.body ?? null);
+      };
+      const seenByAdmin = await listed(OPS);
+      expect(seenByAdmin, path).toContain(foreign);
+      expect(seenByAdmin, path).toContain(own);
+      const mine = await listed(T1);
+      expect(mine, `${path} dropped tenant A's own row`).toContain(own);
+      expect(mine, path).not.toContain(foreign);
+      expect(mine, path).not.toContain(SECRET);
+      for (const bot of t2.bots) expect(mine, `${path} ${bot.name}`).not.toContain(bot.id);
+    }
+  });
+
+  it("keeps foreign ids out of the notifications feed and the team map", async () => {
+    // The weak half of the claim, and kept rather than skipped because a row of either kind does occur on a real
+    // server: neither can be planted through a route here. /api/team-map projects only direct-message channels (groups
+    // stored with dm === true and exactly two bots) and live coordinator handoffs, and neither the package import nor
+    // POST /api/groups makes one; /api/notifications reads the notification log, which only a spend alert or a bot's
+    // own answered turn writes. Both bodies are therefore empty for both tenants today, and what these lines prove is
+    // that they stay free of foreign ids — not that a foreign row would be dropped.
+    for (const path of ["/api/notifications", "/api/team-map"]) {
       const answer = await api("GET", path, undefined, T1);
-      // A refusal would answer with an error body and make the two lines below pass on their own.
       expect(answer.status, path).toBe(200);
       const body = JSON.stringify(answer.body ?? null);
       for (const bot of t2.bots) expect(body, `${path} ${bot.name}`).not.toContain(bot.id);
@@ -371,11 +427,20 @@ describe("Talana cross-tenant leak surfaces", () => {
     // (bot-visibility.ts:465 does it to audienceFloor) and a stripped field reads as absent, which would make this
     // filter match every bot and the test pass on a broken server.
     const listing = await api("GET", "/api/bots?messages=0", undefined, OPS);
-    const loose = listing.body.bots.filter((bot: any) => bot.visibility == null || bot.visibility === "everyone");
+    const bots = listing.body.bots as any[];
+    const loose = bots.filter((bot: any) => bot.visibility == null || bot.visibility === "everyone");
     expect(loose.map((bot: any) => bot.name)).toEqual([]);
+
+    // The filter above cannot tell a staff-by-address helper from a broken stamp: an address without its "@" fails
+    // ENTRY, and storedVisibility then fails closed to "admins" (bot-visibility.ts:47, :54-58) — isolation stays on and
+    // this test stays green while the starter quietly stops belonging to any address. So pin the stamp the boot call
+    // writes, on the one bot here that no provisioning path made.
+    const owned = new Set([...t1.bots, ...t2.bots].map((bot) => bot.id));
+    const starter = bots.filter((bot: any) => !owned.has(bot.id));
+    expect(starter.map((bot: any) => bot.name)).toEqual(["MausBot"]);
+    expect(starter[0].visibility).toEqual({ people: ["@ops.talana.local"] });
   });
 
-  it.skip("proves /api/routines and /api/webhooks filter a foreign row — skipped: the gold-team fixture provisions no routine or webhook for either tenant, so only the absence of a foreign id is asserted above");
   it.skip("proves a foreign upload nothing references is refused — skipped: an unreferenced attachment is served to any signed-in caller by design (bot-visibility.ts:291); the referenced half is asserted above");
   it.skip("proves GET /api/bots/:id and GET /api/groups/:id answer 404 for a foreign row — skipped: neither is a route, and index.ts:15436 answers every unhandled path with 404, so the probe would pass on a server with no isolation at all");
 });
