@@ -12806,11 +12806,15 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const requested = pairingRequest(body);
       if ("error" in requested) return json(res, 400, requested);
+      if ("address" in requested && !auth.scopes.includes("admin")) {
+        return json(res, 403, { error: "Only a platform admin can pair a device as another person." });
+      }
       let opened: ReturnType<typeof sessions.openPairing>;
       try {
         opened = sessions.openPairing(requested);
       } catch (error) {
         if ((error as { code?: unknown }).code === "cloud_personal") return json(res, 403, { error: (error as Error).message, code: "cloud_personal", ...userErrorFields(error) });
+        if ("address" in requested) return json(res, 403, { error: (error as Error).message });
         throw error;
       }
       const base = pairingLinkBase(publicUrl(), auth.kind === "session" ? requestOrigin(req) : null);

@@ -84,9 +84,11 @@ export const TALANA_ADDRESS_SUFFIX = ".talana.local";
  * one dot in the domain) and both the entry and the session email are capped at 320 characters
  * (`config.ts:327`, `sessions.ts:69`). Talana's slug rule (`^[a-z0-9_-]+$`, TenantController::store) sits inside
  * that set, so every tenant Talana can create has an address and onboarding can never be locked out by its own
- * slug. What is refused is an empty slug, a character ENTRY forbids, or a composed address over the cap — all
- * three tested on the slug after it is trimmed and lowercased, and Laravel's mirror
- * App\Services\Bot\BotAddress::tenantDomain() must refuse the same three on the same normalization: neither side
+ * slug. What is refused is an empty slug and a character ENTRY forbids, both tested on the slug after it is trimmed
+ * and lowercased, plus an address over the cap — and the cap is measured on the COMPOSED address, never on the slug
+ * alone, because it grows with the user id. Laravel's mirror App\Services\Bot\BotAddress::tenantDomain() must refuse
+ * the same three on the same normalization, in that order: normalize the slug, refuse an empty one, refuse an
+ * ENTRY-forbidden character, compose `u<id>@t-<slug>.talana.local`, then measure the cap on the result. Neither side
  * may drift. */
 const ENTRY_UNSAFE = /[\s@,;<>"]/;
 export const MAX_ADDRESS_LENGTH = 320;
@@ -222,7 +224,8 @@ export async function handleTalanaSso(
   const issued = config.sessions.issue({
     label: label.slice(0, 80),
     scopes,
-    userId: `talana:${profile.user.id}`,
+    // The coerced id, so the provenance and the email cannot end up naming two different people.
+    userId: `talana:${Number(profile.user.id)}`,
     email: address.email,
   });
 

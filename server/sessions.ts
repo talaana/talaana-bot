@@ -117,6 +117,10 @@ export interface PairingCode {
   member?: TeamMember;
   /** A code a member made from their own session: when the Admin last vouched for them. Absent on the Admin's own. */
   memberCheckedAt?: number;
+  /** A Talana-delegated code: the person it reopens, as their sign-in address. Only an admin caller may set it, only
+   * when the sign-in list already admits it, and the session it opens gets no scope the list withholds. Memory-only,
+   * like every code: `persist()` writes sessions, never pairings. */
+  address?: string;
   /** The session it opens is an access token that lasts exactly this long. */
   tokenTtlMs?: number;
 }
@@ -191,6 +195,7 @@ export interface PairingRequest {
   scopes?: Scope[];
   ttlMs?: number;
   tokenTtlMs?: number;
+  address?: string;
 }
 
 const DAY_MS = 24 * 3_600_000;
@@ -206,9 +211,15 @@ export function pairingRequest(body: unknown): PairingRequest | { error: string 
   const tokenTtlMs = within(record.tokenTtlMs, 60_000, SESSION_MAX_AGE_MS);
   if (tokenTtlMs === null) return { error: `a token lasts from one minute to ${Math.floor(SESSION_MAX_AGE_MS / DAY_MS)} days on this server (OMB_SESSION_MAX_DAYS)` };
   const scopes = Array.isArray(record.scopes) ? record.scopes.filter((v): v is Scope => v === "admin" || v === "client") : undefined;
+  const rawAddress = typeof record.address === "string" ? record.address.trim().toLowerCase() : undefined;
+  // One address, never an `@domain`: a code must name a person, not hand its holder a whole audience.
+  const address = rawAddress !== undefined && rawAddress.length <= 320 && /^[^\s@,;<>"]+@[^\s@,;<>"]+\.[^\s@,;<>"]+$/.test(rawAddress)
+    ? rawAddress
+    : undefined;
   return {
     ...(typeof record.label === "string" ? { label: record.label } : {}), ...(scopes ? { scopes } : {}),
     ...(ttlMs !== undefined ? { ttlMs } : {}), ...(tokenTtlMs !== undefined ? { tokenTtlMs } : {}),
+    ...(address ? { address } : {}),
   };
 }
 
@@ -357,12 +368,18 @@ export class SessionRegistry {
     }
   }
 
-  openPairing(input: { scopes?: Scope[]; label?: string; ttlMs?: number; tokenTtlMs?: number; browser?: boolean; owner?: string; member?: TeamMember; memberCheckedAt?: number } = {}): { id: string; code: string; credential: string; expiresAt: number } {
+  openPairing(input: { scopes?: Scope[]; label?: string; ttlMs?: number; tokenTtlMs?: number; browser?: boolean; owner?: string; member?: TeamMember; memberCheckedAt?: number; address?: string } = {}): { id: string; code: string; credential: string; expiresAt: number } {
     this.prune();
     const now = this.now();
     const code = generatePairingCode();
     const credential = generatePairingCredential();
-    const scopes = input.scopes?.length ? [...new Set(input.scopes)] : [...SCOPES];
+    // An address is a membership claim: the sign-in list is its only authority. Anything else must not open a session.
+    const admitted = input.address ? (this.options.emailScopesSnapshot?.() ?? this.options.emailScopes)?.(input.address) : null;
+    if (input.address && !admitted?.length) throw new Error(`"${input.address.slice(0, 320)}" is not a member of this server`);
+    const scopes = input.scopes?.length
+      ? [...new Set(input.scopes)].filter((scope) => !admitted || admitted.includes(scope))
+      : admitted ? [...admitted] : [...SCOPES];
+    if (input.address && !scopes.length) throw new Error(`"${input.address.slice(0, 320)}" cannot be given any of those scopes`);
     this.refusePersonal(scopes);
     const pairing: PairingCode = {
       id: randomUUID(),
@@ -374,6 +391,7 @@ export class SessionRegistry {
       expiresAt: now + (input.ttlMs ?? PAIRING_CODE_TTL_MS),
       ...(input.browser ? { browser: true as const, ...(input.owner ? { owner: input.owner } : {}) } : {}),
       ...(input.member ? { member: input.member, ...(input.memberCheckedAt !== undefined ? { memberCheckedAt: input.memberCheckedAt } : {}) } : {}),
+      ...(input.address ? { address: input.address } : {}),
       ...(input.tokenTtlMs !== undefined && !input.browser && !input.member ? { tokenTtlMs: input.tokenTtlMs } : {}),
     };
     this.pairings.push(pairing);
@@ -477,6 +495,7 @@ export class SessionRegistry {
       ...(pairing.tokenTtlMs !== undefined ? { token: true as const } : {}),
       ...(pairing.browser ? { cookieOnly: true as const, ...(pairing.owner ? { owner: pairing.owner } : {}) } : {}),
       ...(pairing.member ? { email: pairing.member.email, teamRole: pairing.member.role, membershipAuthority: "team" as const } : {}),
+      ...(!pairing.member && pairing.address ? { email: pairing.address } : {}),
       ...(pairing.member && pairing.memberCheckedAt !== undefined ? { memberCheckedAt: pairing.memberCheckedAt } : {}),
     };
     if (pairing.member && pairing.memberCheckedAt === undefined) this.memberChecked(pairing.member, now);

@@ -329,6 +329,24 @@ describe("pairing codes", () => {
   });
 });
 
+describe("pairing identity", () => {
+  it("reads an address off the code body, trimmed and lower-cased", () => {
+    expect(pairingRequest({ address: " U7@T-TALANA.TALANA.LOCAL ", scopes: ["client"] })).toMatchObject({
+      address: "u7@t-talana.talana.local", scopes: ["client"],
+    });
+  });
+
+  it("refuses anything that is not a single address: a domain entry would name a whole audience", () => {
+    expect(pairingRequest({ address: "@t-talana.talana.local" })).not.toHaveProperty("address");
+    expect(pairingRequest({ address: "u7@t-talana.talana.local, u8@t-talana.talana.local" })).not.toHaveProperty("address");
+    expect(pairingRequest({ address: "x".repeat(321) })).not.toHaveProperty("address");
+  });
+
+  it("never reads an address from a body that does not ask for one", () => {
+    expect(pairingRequest({ label: "Reception iPad", scopes: ["client"] })).not.toHaveProperty("address");
+  });
+});
+
 describe("sessions", () => {
   it("delegates membership only for internally marked portal grants, never ordinary email or a userId prefix", () => {
     registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => null, portalMembership: true });

@@ -167,6 +167,19 @@ describe("Talana SSO sessions", () => {
     expect(sessions.authenticate(ops.token)!.email).toBe("u3@ops.talana.local");
   });
 
+  // One session carries both identity fields, so an id arriving padded (`"007"`) must not leave the provenance
+  // keying a different account than the address does.
+  it("provenances the session with the same id its address carries", async () => {
+    restore = stubTalanaApi(() => "007" as unknown as number);
+    const sessions = registry();
+    const result = await exchange(sessions, "1|abc");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    expect(sessions.authenticate(result.token)!.email).toBe("u7@t-talana.talana.local");
+    expect(sessions.authenticate(result.token)!.userId).toBe("talana:7");
+  });
+
   it("gives one person two addresses when Talana puts them in two stores", async () => {
     restore = stubTalanaApi(() => 7);
     const sessions = registry({ members: ["@t-talana.talana.local", "@t-arg-co.talana.local"] });
@@ -228,6 +241,13 @@ describe("Talana SSO sessions", () => {
     }
   });
 
+  // Every boundary below is derived from the constant, so the constant itself has to be pinned to the length core
+  // measures an audience entry and a session email at: lowering it would keep this file green while drifting from
+  // the grammar the Laravel mirror copies.
+  it("caps an address at the 320 characters core caps an entry at", () => {
+    expect(MAX_ADDRESS_LENGTH).toBe(320);
+  });
+
   // The cap counts the whole composed address, so the longest legal slug is what the id, the label and the
   // suffix leave over.
   it("accepts an address of exactly the cap and refuses one character past it", () => {
@@ -287,5 +307,31 @@ describe("Talana SSO sessions", () => {
     sessions.membershipChanged();
     sessions.revalidateEmailSessions();
     expect(sessions.authenticate(result.token)).toBeNull();
+  });
+
+  // The desktop and phone clients sign in with a pairing code, so a customer's person has to arrive as the same
+  // identity there as in the browser — and must not be able to ask for more than the allowlist grants them.
+  it("mints a code that reopens the same person, capped by the allowlist", async () => {
+    restore = stubTalanaApi(() => 7);
+    const sessions = registry();
+    const web = await exchange(sessions, "1|abc");
+    expect(web.ok).toBe(true);
+    if (!web.ok) return;
+
+    const opened = sessions.openPairing({ scopes: ["client", "admin"], label: "Phone", address: "u7@t-talana.talana.local" });
+    const redeemed = sessions.exchange({ code: opened.code, label: "Pixel", source: "198.51.100.9" });
+    expect(redeemed.ok).toBe(true);
+    if (!redeemed.ok) return;
+
+    const session = sessions.authenticate(redeemed.token)!;
+    expect(session.email).toBe("u7@t-talana.talana.local");
+    expect(session.scopes).toEqual(["client"]);
+    expect(session).not.toHaveProperty("membershipAuthority");
+    expect(personKey(session)).toBe(personKey(sessions.authenticate(web.token)!));
+  });
+
+  it("refuses to mint a code for an address the sign-in list does not admit", () => {
+    const sessions = registry();
+    expect(() => sessions.openPairing({ scopes: ["client"], address: "u99@t-other.talana.local" })).toThrow();
   });
 });
