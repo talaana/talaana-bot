@@ -84,9 +84,10 @@ export const TALANA_ADDRESS_SUFFIX = ".talana.local";
  * one dot in the domain) and both the entry and the session email are capped at 320 characters
  * (`config.ts:327`, `sessions.ts:69`). Talana's slug rule (`^[a-z0-9_-]+$`, TenantController::store) sits inside
  * that set, so every tenant Talana can create has an address and onboarding can never be locked out by its own
- * slug. A slug that is empty, carries a character ENTRY forbids or holds a control character composes to nothing — refuse it.
- * Laravel's mirror is App\Services\Bot\BotAddress::tenantDomain(); neither side may drift. */
-const ENTRY_UNSAFE = /[\s@,;<>"]|[\p{Cc}]/u;
+ * slug. What is refused is an empty slug, a character ENTRY forbids, or a composed address over the cap — the same
+ * three and only those Laravel's mirror App\Services\Bot\BotAddress::tenantDomain() refuses; neither side may
+ * drift. */
+const ENTRY_UNSAFE = /[\s@,;<>"]/;
 export const MAX_ADDRESS_LENGTH = 320;
 export const tenantLabel = (slug: string): string => `t-${slug}`;
 

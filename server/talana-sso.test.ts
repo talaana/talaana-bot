@@ -9,7 +9,7 @@ import { allowedScopes, type SignInAllowList } from "./account-signin.ts";
 import { personKey } from "./person-key.ts";
 import { requiredScope, sessionCookieName } from "./request-auth.ts";
 import { SessionRegistry } from "./sessions.ts";
-import { createTalanaSsoHandler, handleTalanaSso } from "./talana-sso.ts";
+import { createTalanaSsoHandler, handleTalanaSso, talanaAddress } from "./talana-sso.ts";
 import { removeTempDir } from "./testing/cleanup.ts";
 
 const TALANA_API_URL = "https://api.talaana.ir";
@@ -213,6 +213,26 @@ describe("Talana SSO sessions", () => {
       expect(result.ok, `slug ${slug} must have an address`).toBe(true);
       if (!result.ok) continue;
       expect(sessions.authenticate(result.token)!.email).toBe(`u7@t-${slug}.talana.local`);
+    }
+  });
+
+  // ENTRY (bot-visibility.ts:29) refuses whitespace and `@ , ; < > "` and nothing else, and both planes mirror that
+  // set: a guard refusing more here would lock out a store core itself is willing to name in an audience entry.
+  it("refuses a slug only for a character ENTRY refuses", () => {
+    expect(talanaAddress({ userId: 7, superadmin: false, tenantSlug: "a\u0000b" }))
+      .toEqual({ ok: true, email: "u7@t-a\u0000b.talana.local" });
+    expect(talanaAddress({ userId: 7, superadmin: false, tenantSlug: "Bad Slug" }).ok).toBe(false);
+    expect(talanaAddress({ userId: 7, superadmin: false, tenantSlug: "a@b" }).ok).toBe(false);
+    for (const slug of ["a,b", "a;b", "a<b", 'a"b', ""]) {
+      expect(talanaAddress({ userId: 7, superadmin: false, tenantSlug: slug }).ok, `slug ${JSON.stringify(slug)}`).toBe(false);
+    }
+  });
+
+  // A session is keyed by its address, so an id that is not a person's would hand one identity to several people.
+  it.each([0, -1, 2.5, Number.NaN])("refuses the Talana user id %s", (userId) => {
+    for (const superadmin of [false, true]) {
+      expect(talanaAddress({ userId, superadmin, tenantSlug: "talana" }))
+        .toEqual({ ok: false, error: "Talana reported an unusable user id." });
     }
   });
 
