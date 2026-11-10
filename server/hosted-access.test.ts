@@ -375,7 +375,7 @@ describe("hosted bridge in the full server", () => {
     expect((await call(path, { local: true })).body).toEqual({ available: false });
     policyEvidence.push({ slackManagement: management.body, memberStatus: asMember.status, localMembershipAvailable: false });
   }, 30_000);
-  it("treats a session-less local caller as a service by default: the Slack worker's calls work, admin changes need a session", async () => {
+  it("treats a session-less local caller as a service by default: the Slack worker's writes work, its reads need a session", async () => {
     state();
     await restart({ OMB_ADMIN_MEMBERSHIP: "portal", OMB_SHARED_WORKSPACE_FULL_ACCESS: "1", OMB_LOOPBACK_TRUST: undefined });
     expect(log).toContain("local requests: service trust (hosted workspace)");
@@ -395,15 +395,21 @@ describe("hosted bridge in the full server", () => {
     const health = await call("/api/health", { local: true });
     expect(health.status).toBe(200);
     expect(health.body.capabilities).toMatchObject({ guardedMessages: 1, guardedRequests: 1, sharedWorkspaceFullAccess: 1 });
-    expect((await call("/api/bots?messages=0", { local: true })).status).toBe(200);
+    // A session-less local caller no longer gets the bot list: on one process holding many tenants, the everything
+    // viewer that loopback implies is a cross-tenant read, and a bot's own shell is a local caller.
+    const listing = await call("/api/bots?messages=0", { local: true });
+    expect(listing.status).toBe(403);
+    expect(listing.body.error).toMatch(/shared server/);
     const task = await call(`/api/bots/${botId}/tasks`, { method: "POST", local: true, body: { title: "Slack · C1 · 1.0", approvalMode: "full" } });
     expect(task.status, JSON.stringify(task.body)).toBe(201);
     const threadId = task.body.task.threadId as string;
-    const page = await call(`/api/threads/${threadId}/messages?limit=0`, { local: true });
-    expect(page.status).toBe(200);
+    // Same for a thread's messages, so the relay names the leaf it expected rather than reading one: a thread
+    // created on this line has none, and the guarded post below is still what the worker actually needs.
+    const peek = await call(`/api/threads/${threadId}/messages?limit=0`, { local: true });
+    expect(peek.status).toBe(403);
     const sendId = "slackjob_0123456789abcdef";
     const sent = await call(`/api/bots/${botId}/messages/guarded`, { method: "POST", local: true, body: {
-      threadId, text: "hello from Slack", sendId, expectedActiveLeafId: page.body.activeLeafId ?? null, expectedApprovalMode: "full",
+      threadId, text: "hello from Slack", sendId, expectedActiveLeafId: null, expectedApprovalMode: "full",
     } });
     expect(sent.status, JSON.stringify(sent.body)).toBe(202);
     expect((await call(`/api/bots/${botId}/requests/${sendId}?threadId=${threadId}`, { local: true })).status).toBe(200);
@@ -424,7 +430,9 @@ describe("hosted bridge in the full server", () => {
       expect(response.body.error).toMatch(/shared server/);
     }
     expect((await call("/api/auth/session", { cookie: admin })).status).toBe(200);
-    const bots = (await call("/api/bots?messages=0", { local: true })).body.bots;
+    // The check that the refused writes changed nothing is an admin's question, so it is asked with the admin's
+    // session: the bot list is no longer a credential-less read.
+    const bots = (await call("/api/bots?messages=0", { cookie: admin })).body.bots;
     expect(bots.some((bot: any) => bot.name === "Rogue")).toBe(false);
     expect(bots.find((bot: any) => bot.id === botId).approvalMode).not.toBe("auto");
 

@@ -306,9 +306,14 @@ posixOnly("who may answer a card on a shared workspace", () => {
     const task = await api("POST", `/api/bots/${bot.id}/tasks`, { title: "Slack · C1 · 1.0" });
     expect(task.status, JSON.stringify(task.body)).toBe(201);
     const threadId = task.body.task.threadId as string;
-    const page = await api("GET", `/api/threads/${threadId}/messages?limit=0`);
+    // The relay's own read of a thread is no longer session-less: on one process holding many tenants, a local
+    // caller that answers to no person must not see a conversation. The worker's write path — the guarded post —
+    // is unchanged, and a thread that was just created has no leaf to match.
+    const peek = await api("GET", `/api/threads/${threadId}/messages?limit=0`);
+    expect(peek.status).toBe(403);
+    expect(peek.body.error).toMatch(/shared server.*sign in/);
     const guarded = await api("POST", `/api/bots/${bot.id}/messages/guarded`, {
-      threadId, text: "run it", sendId: "slackjob_card_answerers_1", expectedActiveLeafId: page.body.activeLeafId ?? null,
+      threadId, text: "run it", sendId: "slackjob_card_answerers_1", expectedActiveLeafId: null,
     });
     expect(guarded.status, JSON.stringify(guarded.body)).toBe(202);
     const slackCard = await openCard(threadId);

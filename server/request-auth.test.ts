@@ -622,13 +622,10 @@ describe("loopback trust: owner on one person's machine, service on a shared wor
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-  // Every call the deployed cloud Slack worker makes (openmaus-cloud server/slack-worker.ts, every released version): none may break.
+  // Every call the deployed cloud Slack worker makes (openmaus-cloud server/slack-worker.ts, every released version)
+  // except the three reads below: on this fork a session-less local caller is refused those too.
   const SERVICE_CALLS: Array<[string, string]> = [
     ["GET", "/api/health"],
-    ["GET", "/api/bots?messages=0"],
-    ["GET", "/api/threads/thread-1/messages?limit=0"],
-    ["GET", "/api/threads/thread-1/messages?limit=200&before=m-1"],
-    ["GET", "/api/attachments/0b3c9f2e-1a2b-4c5d-8e9f-0a1b2c3d4e5f.png"],
     ["POST", "/api/bots/bot-1/tasks"],
     ["POST", "/api/bots/bot-1/messages/guarded"],
     ["GET", "/api/bots/bot-1/requests/job_0123456789abcdef?threadId=thread-1"],
@@ -640,6 +637,16 @@ describe("loopback trust: owner on one person's machine, service on a shared wor
     ["GET", "/api/internal/agents"],
     ["POST", "/api/internal/hook"],
     ["POST", "/api/testing/internal-capability"],
+  ];
+  // Three of those reads — the bot list, a thread's messages, an attachment — answer with the everything-viewer for
+  // any local request without a credential, because visibility keys off "is this loopback", not off the trust level.
+  // On one process serving many Talana tenants that is a cross-tenant read, so they left SERVICE_ALLOW; a real client
+  // still gets them: the panel sends a bearer session, and a packaged desktop's owner trust is not gated here at all.
+  const SHARED_SERVER_READS_REFUSED: Array<[string, string]> = [
+    ["GET", "/api/bots?messages=0"],
+    ["GET", "/api/threads/thread-1/messages?limit=0"],
+    ["GET", "/api/threads/thread-1/messages?limit=200&before=m-1"],
+    ["GET", "/api/attachments/0b3c9f2e-1a2b-4c5d-8e9f-0a1b2c3d4e5f.png"],
   ];
   const ADMIN_CALLS: Array<[string, string]> = [
     ["PUT", "/api/config"], ["PATCH", "/api/config"], ["GET", "/api/config"],
@@ -655,7 +662,7 @@ describe("loopback trust: owner on one person's machine, service on a shared wor
 
   it("keeps the owner exactly as before when no trust is given or trust is owner", () => {
     for (const trust of [undefined, "owner"] as const) {
-      for (const [method, path] of [...SERVICE_CALLS, ...ADMIN_CALLS]) {
+      for (const [method, path] of [...SERVICE_CALLS, ...SHARED_SERVER_READS_REFUSED, ...ADMIN_CALLS]) {
         expect(check(method, path, { trust }).auth, `${method} ${path}`).toEqual({ kind: "loopback", scopes: ["admin", "client"] });
       }
     }
@@ -665,7 +672,7 @@ describe("loopback trust: owner on one person's machine, service on a shared wor
     for (const [method, path] of SERVICE_CALLS) {
       expect(check(method, path, { trust: "service" }).auth, `${method} ${path}`).toEqual({ kind: "loopback", scopes: ["client"], trust: "service" });
     }
-    for (const [method, path] of ADMIN_CALLS) {
+    for (const [method, path] of [...ADMIN_CALLS, ...SHARED_SERVER_READS_REFUSED]) {
       const denied = check(method, path, { trust: "service" });
       expect(denied.auth, `${method} ${path}`).toBeNull();
       expect(denied.status).toBe(403);

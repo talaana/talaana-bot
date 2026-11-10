@@ -32,6 +32,10 @@ const SERVICE_SCOPES: readonly Scope[] = ["client"];
 /** What a `service`-trust loopback caller may reach: health and identity, the cloud Slack worker's routes (it
  * shares the workspace's network namespace), and the turn-scoped capability routes, whose bearer the handler checks.
  *
+ * The list-and-read routes (`GET /api/bots`, thread messages, attachments) are deliberately not here. A session-less
+ * local caller answers to no person, and `viewerFor` hands every loopback request the everything-viewer, so listing
+ * those routes here would publish every bot's name and every conversation on the machine to any process on it.
+ *
  * Open risk: a bot's shell is a loopback caller too, so it can do everything the Slack worker does: post into any
  * bot's thread through the guarded route, including an existing Full-access thread, open new Full-access threads
  * while the operator's shared Full access is on, stop a request and decline a card. Planned fix: a relay token only
@@ -41,9 +45,6 @@ export const SERVICE_ALLOW: ReadonlyArray<{ methods: readonly string[]; path: Re
   { methods: ["GET"], path: /^\/api\/auth\/session$/ },
   { methods: ["GET"], path: /^\/api\/edition$/ },
   { methods: ["GET"], path: /^\/api\/brand$/ },
-  { methods: ["GET"], path: /^\/api\/bots$/ },
-  { methods: ["GET"], path: /^\/api\/threads\/[\w-]+\/messages$/ },
-  { methods: ["GET"], path: /^\/api\/attachments\/[\w.-]+$/ },
   { methods: ["POST"], path: /^\/api\/bots\/[\w-]+\/tasks$/ },
   { methods: ["POST"], path: /^\/api\/bots\/[\w-]+\/messages\/guarded$/ },
   { methods: ["GET"], path: /^\/api\/bots\/[\w-]+\/requests\/[\w-]+$/ },
