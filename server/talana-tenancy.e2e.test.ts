@@ -161,8 +161,10 @@ describe("Talana tenancy fitness", () => {
   it("stamps every imported bot and derives every imported room's floor", async () => {
     const t1 = await seedTenant(BOSS, "talana");
     expect(t1.status, JSON.stringify(t1)).toBe(201);
-    expect(t1.bots.length).toBe(3);
-    expect(t1.groups.length).toBe(2);
+    // Seven agents and three rooms is the shipping gold catalogue, seeded from AgentTemplateSeeder in talana-backend:
+    // a catalogue that gained or lost a member changes this import's answer, and this suite has to notice.
+    expect(t1.bots.length).toBe(7);
+    expect(t1.groups.length).toBe(3);
 
     for (const bot of t1.bots) expect(bot.visibility, bot.name).toEqual({ people: [TALANA_DOMAIN] });
 
@@ -476,17 +478,19 @@ describe("Talana cross-tenant leak surfaces", () => {
     // that cannot fail. The room is found by the id the import returned rather than by name, because a test above it
     // renames one of tenant A's rooms and both tenants seed the same package.
     const listed = await api("GET", "/api/bots?messages=0", undefined, OPS);
-    const seeded = t1.groups.find((group) => group.name === "اتاق نرخ");
-    expect(seeded, "the gold package provisions no rate room").toBeTruthy();
+    // The name is the catalogue's, from AgentTemplateSeeder in talana-backend: renaming this room there must break
+    // this suite, so the room is looked up by its product name rather than by a name invented here.
+    const seeded = t1.groups.find((group) => group.name === "میز نرخ");
+    expect(seeded, "the gold package provisions no rate desk").toBeTruthy();
     const room = listed.body.groups.find((group: any) => group.id === seeded!.id);
-    expect(room, "the seeded rate room is not on this server").toBeTruthy();
+    expect(room, "the seeded rate desk is not on this server").toBeTruthy();
     expect(room.audienceFloor, "an admin read must carry the field, or there is nothing to compare").toBeTruthy();
     const floorBefore = JSON.stringify(room.audienceFloor);
     // Every member moves, so afterwards tenant B holds all of the room's agents and only the floor stands between it
     // and the transcript: a room one of whose members stays behind is hidden by VisibleSet.group's own member check
     // (bot-visibility.ts:236) whatever its floor says, and a test that stops at that check never reads the floor.
     const members = room.memberIds.filter((id: string) => t1.bots.some((bot) => bot.id === id));
-    expect(members.length, "the rate room holds no agent of tenant A to move").toBe(room.memberIds.length);
+    expect(members.length, "the rate desk holds no agent of tenant A to move").toBe(room.memberIds.length);
 
     const seenBy = async (as: string) => (await api("GET", "/api/bots?messages=0", undefined, as)).body.groups.map((group: any) => group.id);
     // Which side of the floor each neighbour stands on before anything moves.
@@ -512,8 +516,10 @@ describe("Talana cross-tenant leak surfaces", () => {
     expect((await api("GET", `/api/threads/${room.threadId}/messages`, undefined, T2)).status).toBe(404);
 
     // The route the 404 above is read from does answer for a room tenant B holds outright.
-    const theirs = listed.body.groups.find((group: any) => group.id === t2.groups.find((group) => group.name === "اتاق نرخ")?.id);
-    expect(theirs, "tenant B's own rate room is not on this server").toBeTruthy();
+    // Again the catalogue's own room name, from AgentTemplateSeeder in talana-backend: a rename there has to break
+    // this lookup too, rather than leave it quietly finding nothing.
+    const theirs = listed.body.groups.find((group: any) => group.id === t2.groups.find((group) => group.name === "میز نرخ")?.id);
+    expect(theirs, "tenant B's own rate desk is not on this server").toBeTruthy();
     expect((await api("GET", `/api/threads/${theirs!.threadId}/messages`, undefined, T2)).status).toBe(200);
 
     // And each agent that moved takes its own conversation with it: the by-id read this server really has, both ways.
@@ -544,10 +550,12 @@ describe("Talana cross-tenant leak surfaces", () => {
       if (group.dm) continue;
       expect(group.audienceFloor ?? "everyone", `${group.name} booted with no audience floor`).not.toBe("everyone");
     }
-    const stayedId = t1.groups.find((group) => group.name === "اتاق موجودی")?.id;
-    expect(stayedId, "the gold package provisions no stock room").toBeTruthy();
+    // This name too comes from AgentTemplateSeeder in talana-backend: it is the room none of whose agents moved, so
+    // a rename there must break this suite rather than leave the boot-derived floor untested.
+    const stayedId = t1.groups.find((group) => group.name === "پشت دفتر")?.id;
+    expect(stayedId, "the gold package provisions no back office").toBeTruthy();
     const stayed = after.body.groups.find((group: any) => group.id === stayedId);
-    expect(stayed, "tenant A's stock room did not survive the restart").toBeTruthy();
+    expect(stayed, "tenant A's back office did not survive the restart").toBeTruthy();
     expect(stayed.audienceFloor, "the room whose agents never moved came back with a floor they do not say").toEqual({ people: [TALANA_DOMAIN] });
     // The derived floor is enforced, not decorative: the neighbouring tenant is still out of that room's transcript.
     expect((await api("GET", `/api/threads/${stayed.threadId}/messages`, undefined, T2)).status).toBe(404);
