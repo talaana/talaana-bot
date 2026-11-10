@@ -535,7 +535,8 @@ describe("Talana cross-tenant leak surfaces", () => {
     const groupsFile = join(home, ".openmausbot", "groups.json");
     const stored = JSON.parse(readFileSync(groupsFile, "utf8")) as any[];
     const rooms = stored.filter((group) => !group.dm);
-    expect(rooms.length, "the two seeded tenants left no rooms to restart").toBeGreaterThan(1);
+    // Six is two tenants × the catalogue's three rooms, named by AgentTemplateSeeder in talana-backend.
+    expect(rooms.length, "the two seeded tenants left no rooms to restart").toBe(6);
     for (const room of rooms) expect(room.audienceFloor, `${room.name} stored no floor`).toBeTruthy();
     // The floors go, the agents keep their visibility: whatever the listing carries after this boot is derived at
     // start (index.ts:15464), not read back from a floor the previous process wrote.
